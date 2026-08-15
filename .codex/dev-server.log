@@ -1,0 +1,21 @@
+
+> the-system@0.1.0 dev
+> next dev -p 3000
+
+▲ Next.js 16.3.1 (Turbopack)
+- Local:         http://localhost:3000
+- Network:       http://10.15.214.83:3000
+- Environments: .env
+✓ Ready in 1389ms
+✓ Running next.config.ts took 78ms
+Creating turbopack project {
+  dir: 'C:\\Users\\User\\Documents\\Level up\\the-system',
+  testMode: true
+}
+
+○ Compiling / ...
+ GET / 200 in 17.1s (next.js: 9.6s, application-code: 7.5s)
+ GET /admin 200 in 2.3s (next.js: 2.1s, application-code: 274ms)
+ GET / 200 in 470ms (next.js: 38ms, application-code: 432ms)
+ GET / 200 in 1541ms (next.js: 213ms, application-code: 1328ms)
+[?25h
