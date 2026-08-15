@@ -310,7 +310,7 @@ export async function ensurePermanentDailyQuests(): Promise<void> {
       QuestModel.findOneAndUpdate(
         { dailyQuestKey: definition.key },
         { $set: questPayloadFromDailyDefinition(definition) },
-        { new: true, upsert: true, setDefaultsOnInsert: true },
+        { returnDocument: "after", upsert: true, setDefaultsOnInsert: true },
       ),
     ),
   );
