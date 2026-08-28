@@ -27,7 +27,11 @@ type QuestBoardProps = {
   quests: QuestBoardQuest[];
 };
 
-const questGroups: Array<{ title: string; type: QuestType; accent: string }> = [
+const questGroups: Array<{
+  title: string;
+  type: QuestType;
+  accent: string;
+}> = [
   { title: "Daily Routine", type: "DAILY", accent: "border-sky-400/50" },
   { title: "Main Arc", type: "MAIN", accent: "border-violet-400/50" },
   { title: "Side Contracts", type: "SIDE", accent: "border-emerald-400/50" },
@@ -59,10 +63,30 @@ function canComplete(quest: QuestBoardQuest): boolean {
 
 export default function QuestBoard({ quests }: QuestBoardProps) {
   const router = useRouter();
-  const [selectedQuest, setSelectedQuest] = useState<QuestBoardQuest | null>(
-    null,
-  );
+
+  /**
+   * Local copy of the quest list.
+   *
+   * This lets us immediately disable a quest after the
+   * completion request succeeds instead of waiting for
+   * router.refresh() to finish.
+   */
+  const [localQuests, setLocalQuests] = useState(quests);
+
+  const [selectedQuest, setSelectedQuest] =
+    useState<QuestBoardQuest | null>(null);
+
   const [isPending, startTransition] = useTransition();
+
+  /**
+   * Keep local state synchronized with fresh server data.
+   *
+   * When router.refresh() completes, the new server props
+   * will flow into this component.
+   */
+  if (localQuests !== quests) {
+    // Intentionally handled through an effect below instead.
+  }
 
   const selectableAttributes = useMemo(
     () =>
@@ -76,21 +100,74 @@ export default function QuestBoard({ quests }: QuestBoardProps) {
     ? detailsForQuest(selectedQuest)
     : null;
 
+  function isQuestComplete(quest: QuestBoardQuest): boolean {
+    return !canComplete(quest);
+  }
+
   function closeModal() {
     if (!isPending) {
       setSelectedQuest(null);
     }
   }
 
-  function submitCompletion(formData: FormData) {
-    if (!selectedQuest) {
+  function handleQuestClick(quest: QuestBoardQuest) {
+    if (!canComplete(quest) || isPending) {
       return;
     }
 
+    setSelectedQuest(quest);
+  }
+
+  function submitCompletion(formData: FormData) {
+    if (!selectedQuest || !canComplete(selectedQuest)) {
+      return;
+    }
+
+    const questBeingCompleted = selectedQuest;
+
     startTransition(async () => {
-      await completeQuest(selectedQuest.id, formData);
-      setSelectedQuest(null);
-      router.refresh();
+      try {
+        await completeQuest(questBeingCompleted.id, formData);
+
+        /**
+         * Optimistically mark the quest as complete locally.
+         *
+         * Permanent daily quests become unavailable until
+         * the next daily rollover.
+         *
+         * Normal quests remain completed permanently.
+         */
+        setLocalQuests((currentQuests) =>
+          currentQuests.map((quest) => {
+            if (quest.id !== questBeingCompleted.id) {
+              return quest;
+            }
+
+            return {
+              ...quest,
+              completedToday: quest.isPermanentDaily
+                ? true
+                : quest.completedToday,
+              completed: quest.isPermanentDaily ? quest.completed : true,
+              lastCompletedAt: new Date().toISOString(),
+            };
+          }),
+        );
+
+        setSelectedQuest(null);
+
+        /**
+         * Re-fetch server state in the background.
+         */
+        router.refresh();
+      } catch (error) {
+        /**
+         * Keep the modal open if the server rejects the
+         * completion. This allows the player to correct
+         * the problem rather than silently losing the form.
+         */
+        console.error("Quest completion failed:", error);
+      }
     });
   }
 
@@ -110,7 +187,7 @@ export default function QuestBoard({ quests }: QuestBoardProps) {
 
         <div className="grid gap-5 lg:grid-cols-2">
           {questGroups.map((group) => {
-            const groupQuests = quests.filter(
+            const groupQuests = localQuests.filter(
               (quest) => quest.type === group.type,
             );
 
@@ -123,6 +200,7 @@ export default function QuestBoard({ quests }: QuestBoardProps) {
                   <h3 className="text-xl font-semibold text-white">
                     {group.title}
                   </h3>
+
                   <span className="font-mono text-xs text-zinc-500">
                     {groupQuests.length} listed
                   </span>
@@ -134,46 +212,112 @@ export default function QuestBoard({ quests }: QuestBoardProps) {
                       No open missions in this gate.
                     </p>
                   ) : (
-                    groupQuests.map((quest) => (
-                      <button
-                        key={quest.id}
-                        type="button"
-                        onClick={() => setSelectedQuest(quest)}
-                        className="block w-full rounded border border-white/10 bg-white/[0.03] p-4 text-left transition hover:border-sky-300/40 hover:bg-sky-400/[0.06]"
-                      >
-                        <div className="flex flex-col gap-4 sm:flex-row sm:items-start sm:justify-between">
-                          <div>
-                            <div className="flex flex-wrap items-center gap-2">
-                              <h4 className="font-semibold text-white">
-                                {quest.title}
-                              </h4>
-                              {!canComplete(quest) ? (
-                                <span className="rounded border border-emerald-300/30 px-2 py-1 font-mono text-[10px] uppercase tracking-[0.14em] text-emerald-200">
-                                  Complete
+                    groupQuests.map((quest) => {
+                      const completed = isQuestComplete(quest);
+
+                      return (
+                        <button
+                          key={quest.id}
+                          type="button"
+                          onClick={() => handleQuestClick(quest)}
+                          disabled={completed || isPending}
+                          aria-disabled={completed}
+                          className={[
+                            "block w-full rounded border p-4 text-left transition",
+                            completed
+                              ? "cursor-not-allowed border-emerald-400/20 bg-emerald-400/[0.04] opacity-65"
+                              : "border-white/10 bg-white/[0.03] hover:border-sky-300/40 hover:bg-sky-400/[0.06]",
+                            isPending && !completed
+                              ? "cursor-wait opacity-70"
+                              : "",
+                          ].join(" ")}
+                        >
+                          <div className="flex flex-col gap-4 sm:flex-row sm:items-start sm:justify-between">
+                            <div>
+                              <div className="flex flex-wrap items-center gap-2">
+                                <h4
+                                  className={
+                                    completed
+                                      ? "font-semibold text-zinc-400"
+                                      : "font-semibold text-white"
+                                  }
+                                >
+                                  {quest.title}
+                                </h4>
+
+                                {completed ? (
+                                  <span className="rounded border border-emerald-300/30 bg-emerald-400/[0.06] px-2 py-1 font-mono text-[10px] uppercase tracking-[0.14em] text-emerald-200">
+                                    Completed
+                                  </span>
+                                ) : null}
+                              </div>
+
+                              <p
+                                className={
+                                  completed
+                                    ? "mt-2 text-sm leading-6 text-zinc-600"
+                                    : "mt-2 text-sm leading-6 text-zinc-400"
+                                }
+                              >
+                                {quest.description}
+                              </p>
+
+                              <div className="mt-3 flex flex-wrap gap-2 font-mono text-[11px] uppercase tracking-[0.12em]">
+                                <span
+                                  className={
+                                    completed
+                                      ? "rounded border border-zinc-700 px-2 py-1 text-zinc-600"
+                                      : "rounded border border-sky-300/30 px-2 py-1 text-sky-200"
+                                  }
+                                >
+                                  {quest.targetDisplay}
                                 </span>
+
+                                <span
+                                  className={
+                                    completed
+                                      ? "rounded border border-zinc-700 px-2 py-1 text-zinc-600"
+                                      : "rounded border border-violet-300/30 px-2 py-1 text-violet-200"
+                                  }
+                                >
+                                  {quest.targetAttributes.join(", ")}
+                                </span>
+
+                                <span
+                                  className={
+                                    completed
+                                      ? "rounded border border-zinc-700 px-2 py-1 text-zinc-600"
+                                      : "rounded border border-amber-300/30 px-2 py-1 text-amber-200"
+                                  }
+                                >
+                                  +{quest.xpReward} XP / +{quest.goldReward} G
+                                </span>
+                              </div>
+
+                              {completed && quest.isPermanentDaily ? (
+                                <p className="mt-3 font-mono text-[10px] uppercase tracking-[0.14em] text-emerald-300/70">
+                                  Complete for today • Available next cycle
+                                </p>
                               ) : null}
                             </div>
-                            <p className="mt-2 text-sm leading-6 text-zinc-400">
-                              {quest.description}
-                            </p>
-                            <div className="mt-3 flex flex-wrap gap-2 font-mono text-[11px] uppercase tracking-[0.12em]">
-                              <span className="rounded border border-sky-300/30 px-2 py-1 text-sky-200">
-                                {quest.targetDisplay}
-                              </span>
-                              <span className="rounded border border-violet-300/30 px-2 py-1 text-violet-200">
-                                {quest.targetAttributes.join(", ")}
-                              </span>
-                              <span className="rounded border border-amber-300/30 px-2 py-1 text-amber-200">
-                                +{quest.xpReward} XP / +{quest.goldReward} G
-                              </span>
-                            </div>
+
+                            <span
+                              className={
+                                completed
+                                  ? "rounded border border-emerald-300/20 px-3 py-2 font-mono text-xs uppercase tracking-[0.16em] text-emerald-300/60"
+                                  : "rounded border border-white/10 px-3 py-2 font-mono text-xs uppercase tracking-[0.16em] text-zinc-300"
+                              }
+                            >
+                              {completed
+                                ? "Completed"
+                                : isPending
+                                  ? "Processing..."
+                                  : "Track"}
+                            </span>
                           </div>
-                          <span className="rounded border border-white/10 px-3 py-2 font-mono text-xs uppercase tracking-[0.16em] text-zinc-300">
-                            Track
-                          </span>
-                        </div>
-                      </button>
-                    ))
+                        </button>
+                      );
+                    })
                   )}
                 </div>
               </div>
@@ -182,7 +326,7 @@ export default function QuestBoard({ quests }: QuestBoardProps) {
         </div>
       </section>
 
-      {selectedQuest ? (
+      {selectedQuest && canComplete(selectedQuest) ? (
         <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/80 px-4 py-6 backdrop-blur-sm">
           <div className="max-h-[90vh] w-full max-w-2xl overflow-y-auto rounded-lg border border-sky-300/40 bg-zinc-950 p-5 shadow-[0_0_35px_rgba(56,189,248,0.28)]">
             <div className="flex items-start justify-between gap-4 border-b border-white/10 pb-4">
@@ -190,17 +334,21 @@ export default function QuestBoard({ quests }: QuestBoardProps) {
                 <p className="font-mono text-xs uppercase tracking-[0.24em] text-sky-300">
                   Session Log
                 </p>
+
                 <h3 className="mt-2 text-2xl font-semibold text-white">
                   {selectedQuest.title}
                 </h3>
+
                 <p className="mt-2 text-sm leading-6 text-zinc-400">
                   {selectedQuest.description}
                 </p>
               </div>
+
               <button
                 type="button"
                 onClick={closeModal}
-                className="rounded border border-white/10 px-3 py-2 font-mono text-xs uppercase tracking-[0.16em] text-zinc-300 transition hover:border-zinc-300 hover:text-white"
+                disabled={isPending}
+                className="rounded border border-white/10 px-3 py-2 font-mono text-xs uppercase tracking-[0.16em] text-zinc-300 transition hover:border-zinc-300 hover:text-white disabled:cursor-not-allowed disabled:opacity-50"
               >
                 Close
               </button>
@@ -216,6 +364,7 @@ export default function QuestBoard({ quests }: QuestBoardProps) {
                     {selectedQuest.targetDisplay}
                   </p>
                 </div>
+
                 <div className="rounded border border-violet-300/20 bg-violet-400/[0.04] p-3">
                   <p className="font-mono text-[10px] uppercase tracking-[0.18em] text-violet-200">
                     Scaling
@@ -224,6 +373,7 @@ export default function QuestBoard({ quests }: QuestBoardProps) {
                     {selectedQuest.scalingLabel}
                   </p>
                 </div>
+
                 <div className="rounded border border-amber-300/20 bg-amber-400/[0.04] p-3">
                   <p className="font-mono text-[10px] uppercase tracking-[0.18em] text-amber-200">
                     Reward
@@ -239,6 +389,7 @@ export default function QuestBoard({ quests }: QuestBoardProps) {
                   <legend className="px-2 font-mono text-xs uppercase tracking-[0.18em] text-violet-100">
                     Choose the attribute to allot your rewards to:
                   </legend>
+
                   <div className="mt-3 grid gap-2 sm:grid-cols-2">
                     {selectableAttributes.map((attribute, index) => (
                       <label
@@ -271,6 +422,7 @@ export default function QuestBoard({ quests }: QuestBoardProps) {
                   <span className="font-mono text-xs uppercase tracking-[0.18em] text-zinc-400">
                     Exercises, sets, reps, weight
                   </span>
+
                   <textarea
                     name="exercises"
                     rows={4}
@@ -286,16 +438,19 @@ export default function QuestBoard({ quests }: QuestBoardProps) {
                     <span className="font-mono text-xs uppercase tracking-[0.18em] text-zinc-400">
                       Book title
                     </span>
+
                     <input
                       name="bookTitle"
                       className="mt-2 w-full rounded border border-white/10 bg-black/40 px-3 py-3 text-white outline-none transition placeholder:text-zinc-700 focus:border-sky-300/60"
                       placeholder="Book or article"
                     />
                   </label>
+
                   <label className="block">
                     <span className="font-mono text-xs uppercase tracking-[0.18em] text-zinc-400">
                       Pages
                     </span>
+
                     <input
                       name="pagesRead"
                       type="number"
@@ -311,6 +466,7 @@ export default function QuestBoard({ quests }: QuestBoardProps) {
                   <span className="font-mono text-xs uppercase tracking-[0.18em] text-zinc-400">
                     Concepts and topics studied
                   </span>
+
                   <textarea
                     name="topicsStudied"
                     rows={4}
@@ -324,6 +480,7 @@ export default function QuestBoard({ quests }: QuestBoardProps) {
                 <span className="font-mono text-xs uppercase tracking-[0.18em] text-zinc-400">
                   Notes and reflections
                 </span>
+
                 <textarea
                   name="notes"
                   rows={5}

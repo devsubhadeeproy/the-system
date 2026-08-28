@@ -1,5 +1,5 @@
 import Link from "next/link";
-import { buyShopItem, ensurePermanentDailyQuests } from "@/actions/gameActions";
+import { buyShopItem } from "@/actions/gameActions";
 import {
   formatDuration,
   scaledTargetMinutes,
@@ -7,6 +7,7 @@ import {
 import connectMongoDB from "@/lib/mongodb";
 import QuestBoard, { type QuestBoardQuest } from "@/components/QuestBoard";
 import QuestModel, { type QuestTargetAttribute } from "@/models/Quest";
+import DailyQuestCompletionModel from "@/models/DailyQuestCompletion";
 import ShopItemModel from "@/models/ShopItem";
 import UserModel, {
   PLAYER_ATTRIBUTES,
@@ -14,6 +15,7 @@ import UserModel, {
   type PlayerRank,
   type UserAttributes,
 } from "@/models/User";
+import { processDailyQuestRollover } from "@/lib/dailyQuestRollover";
 
 export const dynamic = "force-dynamic";
 export const runtime = "nodejs";
@@ -60,23 +62,19 @@ function xpPercent(currentXp: number, xpToNextLevel: number): number {
   return Math.min(100, Math.round((currentXp / xpToNextLevel) * 100));
 }
 
-function todayRange(): { start: Date; end: Date } {
-  const start = new Date();
-  start.setHours(0, 0, 0, 0);
-
-  const end = new Date(start);
-  end.setDate(end.getDate() + 1);
-
-  return { start, end };
+function getCurrentDateKey(timezone: string): string {
+  return new Intl.DateTimeFormat("en-CA", {
+    timeZone: timezone,
+    year: "numeric",
+    month: "2-digit",
+    day: "2-digit",
+  }).format(new Date());
 }
 
-function completedToday(sessionLogs: { completedAt: Date }[]): boolean {
-  const { start, end } = todayRange();
+function dateKeyToUtcDate(dateKey: string): Date {
+  const [year, month, day] = dateKey.split("-").map(Number);
 
-  return sessionLogs.some((log) => {
-    const completedAt = new Date(log.completedAt);
-    return completedAt >= start && completedAt < end;
-  });
+  return new Date(Date.UTC(year, month - 1, day));
 }
 
 function scalingLabel(direction: string): string {
@@ -91,7 +89,9 @@ function scalingLabel(direction: string): string {
   return "constant";
 }
 
-function normalizeAttributes(rawAttributes: Record<string, unknown>): UserAttributes {
+function normalizeAttributes(
+  rawAttributes: Record<string, unknown>,
+): UserAttributes {
   return PLAYER_ATTRIBUTES.reduce((attributes, attribute) => {
     const legacyKey = attribute.toLowerCase();
     const value = rawAttributes[attribute];
@@ -124,19 +124,22 @@ function targetAttributesForQuest(
 
 async function getDashboardData(): Promise<DashboardData> {
   await connectMongoDB();
-  await ensurePermanentDailyQuests();
 
+  
   const player =
-    (await UserModel.findOne().sort({ createdAt: 1 })) ??
-    (await UserModel.create({ name: "Sung Jin-Woo" }));
-
+  (await UserModel.findOne().sort({ createdAt: 1 })) ??
+  (await UserModel.create({ name: "Sung Jin-Woo" }));
+  
+  await processDailyQuestRollover(player._id);
+  
   const normalizedAttributes = normalizeAttributes(
     player.attributes as UserAttributes & Record<string, unknown>,
   );
 
   if (
     PLAYER_ATTRIBUTES.some(
-      (attribute) => player.attributes[attribute] !== normalizedAttributes[attribute],
+      (attribute) =>
+        player.attributes[attribute] !== normalizedAttributes[attribute],
     )
   ) {
     player.attributes = normalizedAttributes;
@@ -144,10 +147,35 @@ async function getDashboardData(): Promise<DashboardData> {
     await player.save();
   }
 
+  /**
+   * Make sure today's daily records exist before loading them.
+   *
+   * This also means the page is always displaying the state
+   * of the current daily cycle.
+   */
+  const currentDateKey = getCurrentDateKey(player.timezone);
+  const currentDate = dateKeyToUtcDate(currentDateKey);
+
+  /**
+   * Load today's completion state for this player.
+   */
+  const dailyCompletions = await DailyQuestCompletionModel.find({
+    userId: player._id,
+    date: currentDate,
+  }).lean();
+
+  const dailyCompletionByKey = new Map(
+    dailyCompletions.map((completion) => [
+      completion.dailyQuestKey,
+      completion,
+    ]),
+  );
+
   const [quests, shopItems] = await Promise.all([
     QuestModel.find({
       $or: [{ isPermanentDaily: true }, { completed: false }],
     }).sort({ type: 1, isPermanentDaily: -1, createdAt: -1 }),
+
     ShopItemModel.find().sort({ cost: 1, title: 1 }),
   ]);
 
@@ -161,7 +189,17 @@ async function getDashboardData(): Promise<DashboardData> {
       gold: player.gold,
       attributes: normalizedAttributes,
     },
+
     quests: quests.map((quest) => {
+      const dailyCompletion = quest.dailyQuestKey
+        ? dailyCompletionByKey.get(quest.dailyQuestKey)
+        : undefined;
+
+      const completedToday =
+        quest.isPermanentDaily &&
+        quest.type === "DAILY" &&
+        dailyCompletion?.status === "COMPLETED";
+
       const targetMinutes = scaledTargetMinutes(
         quest.baseTargetMinutes,
         quest.scalingDirection,
@@ -178,16 +216,34 @@ async function getDashboardData(): Promise<DashboardData> {
         goldReward: quest.goldReward,
         isPermanentDaily: quest.isPermanentDaily,
         dailyQuestKey: quest.dailyQuestKey,
+
         targetDisplay: formatDuration(
           targetMinutes,
           quest.targetLabel ?? "Standard",
         ),
+
         scalingLabel: scalingLabel(quest.scalingDirection),
-        completedToday: completedToday(quest.sessionLogs),
-        completed: quest.completed,
-        lastCompletedAt: quest.sessionLogs.at(-1)?.completedAt.toISOString(),
+
+        /**
+         * This is now based on DailyQuestCompletion rather
+         * than Quest.completed/sessionLogs.
+         */
+        completedToday,
+
+        /**
+         * Normal quests still use Quest.completed.
+         * Permanent daily quests use their daily record.
+         */
+        completed: quest.isPermanentDaily
+          ? completedToday
+          : quest.completed,
+
+        lastCompletedAt: dailyCompletion?.completedAt
+          ? new Date(dailyCompletion.completedAt).toISOString()
+          : undefined,
       };
     }),
+
     shopItems: shopItems.map((item) => ({
       id: item._id.toString(),
       title: item.title,
@@ -210,10 +266,12 @@ export default async function Home() {
             <p className="font-mono text-xs uppercase tracking-[0.32em] text-sky-300">
               System Interface
             </p>
+
             <h1 className="mt-3 text-4xl font-semibold tracking-normal text-white sm:text-5xl">
               Hunter Dashboard
             </h1>
           </div>
+
           <Link
             href="/admin"
             className="w-fit rounded border border-violet-300/40 px-4 py-2 font-mono text-xs uppercase tracking-[0.2em] text-violet-100 shadow-[0_0_15px_rgba(192,132,252,0.24)] transition hover:border-violet-200 hover:bg-violet-400/10"
@@ -229,28 +287,38 @@ export default async function Home() {
                 <p className="font-mono text-xs uppercase tracking-[0.24em] text-zinc-500">
                   Player
                 </p>
+
                 <h2 className="mt-2 text-3xl font-semibold text-white">
                   {player.name}
                 </h2>
               </div>
+
               <div className="flex flex-wrap gap-3">
                 <div className="rounded border border-violet-300/50 px-4 py-3 text-center shadow-[0_0_15px_rgba(192,132,252,0.24)]">
                   <p className="font-mono text-[10px] uppercase tracking-[0.2em] text-violet-200">
                     Rank
                   </p>
-                  <p className="text-2xl font-bold text-white">{player.rank}</p>
+                  <p className="text-2xl font-bold text-white">
+                    {player.rank}
+                  </p>
                 </div>
+
                 <div className="rounded border border-sky-300/40 px-4 py-3 text-center">
                   <p className="font-mono text-[10px] uppercase tracking-[0.2em] text-sky-200">
                     Level
                   </p>
-                  <p className="text-2xl font-bold text-white">{player.level}</p>
+                  <p className="text-2xl font-bold text-white">
+                    {player.level}
+                  </p>
                 </div>
+
                 <div className="rounded border border-amber-300/40 px-4 py-3 text-center">
                   <p className="font-mono text-[10px] uppercase tracking-[0.2em] text-amber-200">
                     Gold
                   </p>
-                  <p className="text-2xl font-bold text-white">{player.gold}</p>
+                  <p className="text-2xl font-bold text-white">
+                    {player.gold}
+                  </p>
                 </div>
               </div>
             </div>
@@ -258,10 +326,12 @@ export default async function Home() {
             <div className="mt-6">
               <div className="mb-2 flex items-center justify-between font-mono text-xs uppercase tracking-[0.18em] text-zinc-400">
                 <span>Experience</span>
+
                 <span>
                   {player.currentXp} / {player.xpToNextLevel} XP
                 </span>
               </div>
+
               <div className="h-4 overflow-hidden rounded border border-sky-300/30 bg-zinc-900">
                 <div
                   className="h-full bg-gradient-to-r from-sky-400 to-violet-400 shadow-[0_0_15px_rgba(56,189,248,0.55)]"
@@ -279,9 +349,11 @@ export default async function Home() {
                   <p className="font-mono text-xs uppercase tracking-[0.2em] text-sky-200">
                     {attribute}
                   </p>
+
                   <p className="mt-2 text-3xl font-semibold text-white">
                     {player.attributes[attribute]}
                   </p>
+
                   <p className="mt-1 text-[11px] text-zinc-500">
                     {attributeDescriptions[attribute]}
                   </p>
@@ -296,12 +368,17 @@ export default async function Home() {
                 <p className="font-mono text-xs uppercase tracking-[0.24em] text-violet-200">
                   Shadow Market
                 </p>
-                <h2 className="mt-2 text-2xl font-semibold text-white">Shop</h2>
+
+                <h2 className="mt-2 text-2xl font-semibold text-white">
+                  Shop
+                </h2>
               </div>
+
               <span className="font-mono text-sm text-amber-200">
                 {player.gold} G
               </span>
             </div>
+
             <div className="mt-5 space-y-3">
               {shopItems.length === 0 ? (
                 <p className="rounded border border-white/10 bg-white/[0.03] p-4 text-sm text-zinc-400">
@@ -315,21 +392,30 @@ export default async function Home() {
                   >
                     <div className="flex items-start justify-between gap-3">
                       <div>
-                        <h3 className="font-semibold text-white">{item.title}</h3>
+                        <h3 className="font-semibold text-white">
+                          {item.title}
+                        </h3>
+
                         <p className="mt-1 text-sm leading-6 text-zinc-400">
                           {item.description}
                         </p>
                       </div>
+
                       <p className="whitespace-nowrap font-mono text-sm text-amber-200">
                         {item.cost} G
                       </p>
                     </div>
-                    <form action={buyShopItem.bind(null, item.id)} className="mt-4">
+
+                    <form
+                      action={buyShopItem.bind(null, item.id)}
+                      className="mt-4"
+                    >
                       <button
                         type="submit"
                         disabled={
                           player.gold < item.cost ||
-                          (typeof item.stock === "number" && item.stock <= 0)
+                          (typeof item.stock === "number" &&
+                            item.stock <= 0)
                         }
                         className="w-full rounded border border-violet-300/40 px-3 py-2 font-mono text-xs uppercase tracking-[0.18em] text-violet-100 transition hover:border-violet-200 hover:bg-violet-400/10 disabled:cursor-not-allowed disabled:border-zinc-700 disabled:text-zinc-600"
                       >

@@ -1,327 +1,212 @@
 "use server";
 
-import { revalidatePath } from "next/cache";
 import { Types } from "mongoose";
-import {
-  DAILY_QUEST_DEFINITIONS,
-  type DailyQuestDefinition,
-} from "@/lib/dailyQuests";
+import { revalidatePath } from "next/cache";
+
 import connectMongoDB from "@/lib/mongodb";
-import QuestModel, {
-  QUEST_TARGET_ATTRIBUTES,
-  QUEST_TYPES,
-  type QuestSessionLogDetails,
-  type QuestTargetAttribute,
-  type QuestType,
-} from "@/models/Quest";
+import QuestModel from "@/models/Quest";
+import DailyQuestCompletionModel from "@/models/DailyQuestCompletion";
 import ShopItemModel from "@/models/ShopItem";
 import UserModel, {
   PLAYER_ATTRIBUTES,
   type PlayerAttribute,
-  type UserAttributes,
-  type UserDocument,
 } from "@/models/User";
 
-const DEFAULT_PLAYER_NAME = "Sung Jin-Woo";
-const ATTRIBUTE_REWARD_AMOUNT = 1;
+import { processDailyQuestRollover } from "@/lib/dailyQuestRollover";
 
-export type QuestFormData = {
-  title: string;
-  description: string;
-  type: QuestType;
-  targetAttributes: QuestTargetAttribute[];
-  xpReward: number;
-  goldReward: number;
-};
+function formString(formData: FormData, name: string): string {
+  const value = formData.get(name);
 
-export type ShopItemFormData = {
-  title: string;
-  description: string;
-  cost: number;
-  stock?: number;
-};
-
-async function getOrCreatePlayer(): Promise<UserDocument> {
-  const existingPlayer = await UserModel.findOne().sort({ createdAt: 1 });
-
-  if (!existingPlayer) {
-    return UserModel.create({
-      name: DEFAULT_PLAYER_NAME,
-    });
-  }
-
-  let changed = false;
-  const rawAttributes = existingPlayer.attributes as UserAttributes &
-    Record<string, unknown>;
-
-  for (const attribute of PLAYER_ATTRIBUTES) {
-    const legacyKey = attribute.toLowerCase();
-    const legacyValue = rawAttributes[legacyKey];
-
-    if (typeof rawAttributes[attribute] !== "number") {
-      rawAttributes[attribute] =
-        typeof legacyValue === "number" ? legacyValue : 10;
-      changed = true;
-    }
-  }
-
-  if (changed) {
-    existingPlayer.markModified("attributes");
-    await existingPlayer.save();
-  }
-
-  return existingPlayer;
+  return typeof value === "string" ? value.trim() : "";
 }
 
-function assertObjectId(id: string, label: string): void {
-  if (!Types.ObjectId.isValid(id)) {
-    throw new Error(`Invalid ${label} id.`);
-  }
+function formOptionalString(
+  formData: FormData,
+  name: string,
+): string | undefined {
+  const value = formString(formData, name);
+
+  return value.length > 0 ? value : undefined;
 }
 
-function requiredString(value: unknown, field: string): string {
-  if (typeof value !== "string") {
-    throw new Error(`${field} must be a string.`);
-  }
-
-  const trimmedValue = value.trim();
-
-  if (!trimmedValue) {
-    throw new Error(`${field} is required.`);
-  }
-
-  return trimmedValue;
-}
-
-function optionalString(value: unknown): string | undefined {
-  if (typeof value !== "string") {
-    return undefined;
-  }
-
-  const trimmedValue = value.trim();
-  return trimmedValue ? trimmedValue : undefined;
-}
-
-function nonNegativeNumber(value: unknown, field: string): number {
-  const parsedValue =
-    typeof value === "number" ? value : Number.parseInt(String(value), 10);
-
-  if (!Number.isFinite(parsedValue) || parsedValue < 0) {
-    throw new Error(`${field} must be a non-negative number.`);
-  }
-
-  return parsedValue;
-}
-
-function optionalNonNegativeNumber(
-  value: unknown,
-  field: string,
+function formOptionalNumber(
+  formData: FormData,
+  name: string,
 ): number | undefined {
-  if (value === undefined || value === null || value === "") {
+  const value = formString(formData, name);
+
+  if (!value) {
     return undefined;
   }
 
-  return nonNegativeNumber(value, field);
-}
+  const parsed = Number(value);
 
-function optionalStock(value: unknown): number | undefined {
-  return optionalNonNegativeNumber(value, "Stock");
-}
-
-function enumValue<const T extends readonly string[]>(
-  value: unknown,
-  allowedValues: T,
-  field: string,
-): T[number] {
-  if (typeof value !== "string" || !allowedValues.includes(value)) {
-    throw new Error(`${field} is invalid.`);
+  if (!Number.isFinite(parsed) || parsed < 0) {
+    throw new Error(`Invalid ${name}.`);
   }
 
-  return value;
+  return parsed;
 }
 
-function formValue(formData: FormData, key: string): FormDataEntryValue | null {
-  return formData.get(key);
+function getCurrentDateKey(timezone: string): string {
+  return new Intl.DateTimeFormat("en-CA", {
+    timeZone: timezone,
+    year: "numeric",
+    month: "2-digit",
+    day: "2-digit",
+  }).format(new Date());
 }
 
-function formValues(formData: FormData, key: string): FormDataEntryValue[] {
-  return formData.getAll(key);
-}
+function dateKeyToUtcDate(dateKey: string): Date {
+  const [year, month, day] = dateKey.split("-").map(Number);
 
-function parseTargetAttributes(values: unknown[]): QuestTargetAttribute[] {
-  const attributes = values
-    .map((value) => enumValue(value, QUEST_TARGET_ATTRIBUTES, "Target attribute"))
-    .filter((value, index, array) => array.indexOf(value) === index);
-
-  if (attributes.length === 0) {
-    return ["NONE"];
+  if (
+    !Number.isInteger(year) ||
+    !Number.isInteger(month) ||
+    !Number.isInteger(day)
+  ) {
+    throw new Error(`Invalid date key: ${dateKey}`);
   }
 
-  if (attributes.includes("NONE") && attributes.length > 1) {
-    return attributes.filter((attribute) => attribute !== "NONE");
-  }
-
-  return attributes;
+  return new Date(Date.UTC(year, month - 1, day));
 }
 
-function parseQuestFormData(data: QuestFormData | FormData): QuestFormData {
-  if (data instanceof FormData) {
-    const targetAttributeValues = formValues(data, "targetAttributes");
-    const legacyTargetAttribute = formValue(data, "targetAttribute");
+function parseSelectedAttribute(
+  formData: FormData,
+  allowedAttributes: PlayerAttribute[],
+): PlayerAttribute {
+  const value = formString(formData, "selectedAttribute");
 
-    return {
-      title: requiredString(formValue(data, "title"), "Title"),
-      description: requiredString(formValue(data, "description"), "Description"),
-      type: enumValue(formValue(data, "type"), QUEST_TYPES, "Quest type"),
-      targetAttributes: parseTargetAttributes(
-        targetAttributeValues.length > 0
-          ? targetAttributeValues
-          : [legacyTargetAttribute],
-      ),
-      xpReward: nonNegativeNumber(formValue(data, "xpReward"), "XP reward"),
-      goldReward: nonNegativeNumber(
-        formValue(data, "goldReward"),
-        "Gold reward",
-      ),
-    };
+  if (!value || !PLAYER_ATTRIBUTES.includes(value as PlayerAttribute)) {
+    throw new Error("A valid reward attribute must be selected.");
   }
 
+  const attribute = value as PlayerAttribute;
+
+  if (!allowedAttributes.includes(attribute)) {
+    throw new Error("The selected attribute is not valid for this quest.");
+  }
+
+  return attribute;
+}
+
+function validateQuestDetails(formData: FormData) {
   return {
-    title: requiredString(data.title, "Title"),
-    description: requiredString(data.description, "Description"),
-    type: enumValue(data.type, QUEST_TYPES, "Quest type"),
-    targetAttributes: parseTargetAttributes(data.targetAttributes),
-    xpReward: nonNegativeNumber(data.xpReward, "XP reward"),
-    goldReward: nonNegativeNumber(data.goldReward, "Gold reward"),
+    exercises: formOptionalString(formData, "exercises"),
+    bookTitle: formOptionalString(formData, "bookTitle"),
+    pagesRead: formOptionalNumber(formData, "pagesRead"),
+    topicsStudied: formOptionalString(formData, "topicsStudied"),
+    notes: formOptionalString(formData, "notes"),
   };
 }
 
-function parseShopItemFormData(data: ShopItemFormData | FormData): ShopItemFormData {
-  if (data instanceof FormData) {
-    return {
-      title: requiredString(formValue(data, "title"), "Title"),
-      description: requiredString(formValue(data, "description"), "Description"),
-      cost: nonNegativeNumber(formValue(data, "cost"), "Cost"),
-      stock: optionalStock(formValue(data, "stock")),
-    };
-  }
-
-  return {
-    title: requiredString(data.title, "Title"),
-    description: requiredString(data.description, "Description"),
-    cost: nonNegativeNumber(data.cost, "Cost"),
-    stock: optionalStock(data.stock),
-  };
+function calculateXpToNextLevel(level: number): number {
+  return 100 + (level - 1) * 25;
 }
 
-function parseSessionLogDetails(formData: FormData): QuestSessionLogDetails {
-  return {
-    exercises: optionalString(formValue(formData, "exercises")),
-    bookTitle: optionalString(formValue(formData, "bookTitle")),
-    pagesRead: optionalNonNegativeNumber(formValue(formData, "pagesRead"), "Pages read"),
-    topicsStudied: optionalString(formValue(formData, "topicsStudied")),
-    notes: optionalString(formValue(formData, "notes")),
-  };
-}
+function applyXpAndLevelUps(
+  user: {
+    currentXp: number;
+    xpToNextLevel: number;
+    level: number;
+  },
+  xpReward: number,
+): void {
+  user.currentXp += xpReward;
 
-function applyLevelUps(player: UserDocument): void {
-  while (player.currentXp >= player.xpToNextLevel) {
-    player.currentXp -= player.xpToNextLevel;
-    player.level += 1;
-    player.xpToNextLevel = Math.ceil(player.xpToNextLevel * 1.25);
+  while (user.currentXp >= user.xpToNextLevel) {
+    user.currentXp -= user.xpToNextLevel;
+    user.level += 1;
+    user.xpToNextLevel = calculateXpToNextLevel(user.level);
   }
 }
 
-function todayRange(): { start: Date; end: Date } {
-  const start = new Date();
-  start.setHours(0, 0, 0, 0);
+export async function buyShopItem(itemId: string): Promise<void> {
+  await connectMongoDB();
 
-  const end = new Date(start);
-  end.setDate(end.getDate() + 1);
+  if (!Types.ObjectId.isValid(itemId)) {
+    throw new Error("Invalid shop item ID.");
+  }
 
-  return { start, end };
-}
-
-function hasCompletedToday(sessionLogs: { completedAt: Date }[]): boolean {
-  const { start, end } = todayRange();
-
-  return sessionLogs.some((log) => {
-    const completedAt = new Date(log.completedAt);
-    return completedAt >= start && completedAt < end;
+  const user = await UserModel.findOne().sort({
+    createdAt: 1,
   });
-}
 
-function chooseRewardAttribute(
-  targetAttributes: QuestTargetAttribute[],
-  selectedAttribute: FormDataEntryValue | null,
-): PlayerAttribute | undefined {
-  const rewardAttributes = targetAttributes.filter(
-    (attribute): attribute is PlayerAttribute => attribute !== "NONE",
-  );
-
-  if (rewardAttributes.length === 0) {
-    return undefined;
+  if (!user) {
+    throw new Error("Player not found.");
   }
 
-  if (rewardAttributes.length === 1) {
-    return rewardAttributes[0];
+  const item = await ShopItemModel.findById(itemId);
+
+  if (!item) {
+    throw new Error("Shop item not found.");
   }
 
-  const chosenAttribute = enumValue(
-    selectedAttribute,
-    PLAYER_ATTRIBUTES,
-    "Chosen reward attribute",
-  );
-
-  if (!rewardAttributes.includes(chosenAttribute)) {
-    throw new Error("Chosen reward attribute is not valid for this quest.");
+  if (user.gold < item.cost) {
+    throw new Error("Not enough gold.");
   }
 
-  return chosenAttribute;
-}
+  if (typeof item.stock === "number" && item.stock <= 0) {
+    throw new Error("This item is out of stock.");
+  }
 
-function revalidateGameRoutes(): void {
+  user.gold -= item.cost;
+
+  if (typeof item.stock === "number") {
+    item.stock -= 1;
+    await item.save();
+  }
+
+  await user.save();
+
   revalidatePath("/");
   revalidatePath("/admin");
 }
 
-function questPayloadFromDailyDefinition(definition: DailyQuestDefinition) {
-  return {
-    title: definition.title,
-    description: definition.description,
-    type: "DAILY" as const,
-    targetAttributes: definition.targetAttributes,
-    xpReward: definition.xpReward,
-    goldReward: definition.goldReward,
-    completed: false,
-    isPermanentDaily: true,
-    dailyQuestKey: definition.key,
-    baseTargetMinutes: definition.baseTargetMinutes,
-    targetLabel: definition.targetLabel,
-    scalingDirection: definition.scalingDirection,
-  };
-}
-
-export async function ensurePermanentDailyQuests(): Promise<void> {
-  await connectMongoDB();
-
-  await Promise.all(
-    DAILY_QUEST_DEFINITIONS.map((definition) =>
-      QuestModel.findOneAndUpdate(
-        { dailyQuestKey: definition.key },
-        { $set: questPayloadFromDailyDefinition(definition) },
-        { returnDocument: "after", upsert: true, setDefaultsOnInsert: true },
-      ),
-    ),
-  );
-}
-
 export async function completeQuest(
   questId: string,
-  formData?: FormData,
+  formData: FormData,
 ): Promise<void> {
   await connectMongoDB();
-  assertObjectId(questId, "quest");
+
+  if (!Types.ObjectId.isValid(questId)) {
+    throw new Error("Invalid quest ID.");
+  }
+
+  /**
+   * The application currently has one player.
+   *
+   * This can later be replaced with the authenticated
+   * user's ID.
+   */
+  const user = await UserModel.findOne().sort({
+    createdAt: 1,
+  });
+
+  if (!user) {
+    throw new Error("Player not found.");
+  }
+
+  /**
+   * Always process rollover before completing a quest.
+   *
+   * This guarantees that:
+   * - yesterday's quests have been resolved
+   * - today's records exist
+   * - missed penalties have been applied
+   */
+  await processDailyQuestRollover(user._id);
+
+  /**
+   * Re-fetch because rollover may have changed:
+   * - attributes
+   * - lastDailyQuestProcessedDate
+   */
+  const currentUser = await UserModel.findById(user._id);
+
+  if (!currentUser) {
+    throw new Error("Player not found.");
+  }
 
   const quest = await QuestModel.findById(questId);
 
@@ -329,95 +214,150 @@ export async function completeQuest(
     throw new Error("Quest not found.");
   }
 
-  if (quest.isPermanentDaily && hasCompletedToday(quest.sessionLogs)) {
+  /**
+   * =====================================================
+   * PERMANENT DAILY QUEST
+   * =====================================================
+   */
+  if (quest.isPermanentDaily && quest.type === "DAILY") {
+    if (!quest.dailyQuestKey) {
+      throw new Error("Permanent daily quest is missing dailyQuestKey.");
+    }
+
+    const dateKey = getCurrentDateKey(currentUser.timezone);
+
+    const date = new Date(`${dateKey}T00:00:00.000Z`);
+
+    const dailyRecord = await DailyQuestCompletionModel.findOne({
+      userId: currentUser._id,
+      dailyQuestKey: quest.dailyQuestKey,
+      date,
+    });
+
+    if (!dailyRecord) {
+      throw new Error("Today's daily quest record does not exist.");
+    }
+
+    if (dailyRecord.status === "COMPLETED") {
+      throw new Error("This daily quest has already been completed today.");
+    }
+
+    if (dailyRecord.status === "MISSED") {
+      throw new Error("This daily quest has already been missed.");
+    }
+
+    /**
+     * Determine which attribute receives the reward.
+     */
+    const selectableAttributes = quest.targetAttributes.filter(
+      (attribute): attribute is PlayerAttribute =>
+        attribute !== "NONE" && PLAYER_ATTRIBUTES.includes(attribute),
+    );
+
+    if (selectableAttributes.length === 0) {
+      throw new Error("This quest does not have a valid reward attribute.");
+    }
+
+    let allottedAttribute: PlayerAttribute;
+
+    if (selectableAttributes.length === 1) {
+      allottedAttribute = selectableAttributes[0];
+    } else {
+      allottedAttribute = parseSelectedAttribute(
+        formData,
+        selectableAttributes,
+      );
+    }
+
+    const details = validateQuestDetails(formData);
+
+    /**
+     * Atomically transition AVAILABLE -> COMPLETED.
+     *
+     * This prevents two simultaneous completion requests
+     * from awarding the reward twice.
+     */
+    const updatedDailyRecord = await DailyQuestCompletionModel.findOneAndUpdate(
+      {
+        _id: dailyRecord._id,
+        status: "AVAILABLE",
+      },
+      {
+        $set: {
+          status: "COMPLETED",
+          completedAt: new Date(),
+          allottedAttribute,
+          details,
+        },
+      },
+      {
+        new: true,
+      },
+    );
+
+    if (!updatedDailyRecord) {
+      throw new Error(
+        "Quest completion could not be finalized. It may have already been completed.",
+      );
+    }
+
+    /**
+     * Award the player.
+     */
+    currentUser.attributes[allottedAttribute] += 1;
+
+    applyXpAndLevelUps(currentUser, quest.xpReward);
+
+    currentUser.gold += quest.goldReward;
+
+    currentUser.markModified("attributes");
+
+    await currentUser.save();
+
+    revalidatePath("/");
+    revalidatePath("/admin");
+
     return;
   }
 
-  if (!quest.isPermanentDaily && quest.completed) {
-    return;
+  /**
+   * =====================================================
+   * NORMAL MAIN / SIDE / URGENT QUEST
+   * =====================================================
+   */
+
+  if (quest.completed) {
+    throw new Error("This quest has already been completed.");
   }
 
-  const player = await getOrCreatePlayer();
-  const selectedAttribute = chooseRewardAttribute(
-    quest.targetAttributes,
-    formData?.get("selectedAttribute") ?? null,
+  const selectableAttributes = quest.targetAttributes.filter(
+    (attribute): attribute is PlayerAttribute =>
+      attribute !== "NONE" && PLAYER_ATTRIBUTES.includes(attribute),
   );
 
-  if (selectedAttribute) {
-    player.attributes[selectedAttribute] += ATTRIBUTE_REWARD_AMOUNT;
-    player.markModified(`attributes.${selectedAttribute}`);
+  let allottedAttribute: PlayerAttribute | undefined;
+
+  if (selectableAttributes.length === 1) {
+    allottedAttribute = selectableAttributes[0];
+  } else if (selectableAttributes.length > 1) {
+    allottedAttribute = parseSelectedAttribute(formData, selectableAttributes);
   }
 
-  player.currentXp += quest.xpReward;
-  player.gold += quest.goldReward;
-  applyLevelUps(player);
+  quest.completed = true;
 
-  quest.sessionLogs.push({
-    completedAt: new Date(),
-    allottedAttribute: selectedAttribute,
-    details: formData ? parseSessionLogDetails(formData) : {},
-  });
+  await quest.save();
 
-  if (!quest.isPermanentDaily) {
-    quest.completed = true;
+  if (allottedAttribute) {
+    currentUser.attributes[allottedAttribute] += 1;
+    currentUser.markModified("attributes");
   }
 
-  await Promise.all([quest.save(), player.save()]);
-  revalidateGameRoutes();
-}
+  applyXpAndLevelUps(currentUser, quest.xpReward);
 
-export async function createQuest(
-  data: QuestFormData | FormData,
-): Promise<void> {
-  await connectMongoDB();
+  currentUser.gold += quest.goldReward;
 
-  const questData = parseQuestFormData(data);
-  await QuestModel.create({
-    ...questData,
-    completed: false,
-    isPermanentDaily: false,
-    scalingDirection: "CONSTANT",
-  });
-  revalidateGameRoutes();
-}
+  await currentUser.save();
 
-export async function createShopItem(
-  data: ShopItemFormData | FormData,
-): Promise<void> {
-  await connectMongoDB();
-
-  const itemData = parseShopItemFormData(data);
-  await ShopItemModel.create(itemData);
-  revalidateGameRoutes();
-}
-
-export async function buyShopItem(itemId: string): Promise<void> {
-  await connectMongoDB();
-  assertObjectId(itemId, "shop item");
-
-  const [item, player] = await Promise.all([
-    ShopItemModel.findById(itemId),
-    getOrCreatePlayer(),
-  ]);
-
-  if (!item) {
-    throw new Error("Shop item not found.");
-  }
-
-  if (typeof item.stock === "number" && item.stock <= 0) {
-    return;
-  }
-
-  if (player.gold < item.cost) {
-    return;
-  }
-
-  player.gold -= item.cost;
-
-  if (typeof item.stock === "number") {
-    item.stock -= 1;
-  }
-
-  await Promise.all([player.save(), item.save()]);
-  revalidateGameRoutes();
+  revalidatePath("/");
+  revalidatePath("/admin");
 }
