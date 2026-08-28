@@ -10,38 +10,29 @@ import ShopItemModel from "@/models/ShopItem";
 import UserModel, {
   PLAYER_ATTRIBUTES,
   type PlayerAttribute,
+  type PlayerRank,
 } from "@/models/User";
-import { processDailyQuestRollover } from "@/lib/dailyQuestRollover";
 import {
-  getRankReward,
-  rankForLevel,
-} from "@/lib/rankProgression";
+  getCurrentGameDateKey,
+  processDailyQuestRollover,
+} from "@/lib/dailyQuestRollover";
+import { getRankReward, rankForLevel } from "@/lib/rankProgression";
 
 function formString(formData: FormData, name: string): string {
   const value = formData.get(name);
   return typeof value === "string" ? value.trim() : "";
 }
 
-function formOptionalString(
-  formData: FormData,
-  name: string,
-): string | undefined {
+function formOptionalString(formData: FormData, name: string): string | undefined {
   const value = formString(formData, name);
   return value.length > 0 ? value : undefined;
 }
 
-function formOptionalNumber(
-  formData: FormData,
-  name: string,
-): number | undefined {
+function formOptionalNumber(formData: FormData, name: string): number | undefined {
   const value = formString(formData, name);
-
-  if (!value) {
-    return undefined;
-  }
+  if (!value) return undefined;
 
   const parsed = Number(value);
-
   if (!Number.isFinite(parsed) || parsed < 0) {
     throw new Error(`Invalid ${name}.`);
   }
@@ -52,11 +43,7 @@ function formOptionalNumber(
 function dateKeyToUtcDate(dateKey: string): Date {
   const [year, month, day] = dateKey.split("-").map(Number);
 
-  if (
-    !Number.isInteger(year) ||
-    !Number.isInteger(month) ||
-    !Number.isInteger(day)
-  ) {
+  if (!Number.isInteger(year) || !Number.isInteger(month) || !Number.isInteger(day)) {
     throw new Error(`Invalid date key: ${dateKey}`);
   }
 
@@ -74,7 +61,6 @@ function parseSelectedAttribute(
   }
 
   const attribute = value as PlayerAttribute;
-
   if (!allowedAttributes.includes(attribute)) {
     throw new Error("The selected attribute is not valid for this quest.");
   }
@@ -96,22 +82,22 @@ function calculateXpToNextLevel(level: number): number {
   return 100 + (level - 1) * 25;
 }
 
+type RankRewardRecord = {
+  rank: PlayerRank;
+  title: string;
+  description: string;
+  triggerObject: string;
+  alterEgoName: string;
+  unlockedAt: Date;
+};
+
 function applyXpAndLevelUps(
   user: {
     currentXp: number;
     xpToNextLevel: number;
     level: number;
-    rank: Parameters<typeof rankForLevel>[0] extends never
-      ? never
-      : import("@/models/User").PlayerRank;
-    unlockedRankRewards: Array<{
-      rank: import("@/models/User").PlayerRank;
-      title: string;
-      description: string;
-      triggerObject: string;
-      alterEgoName: string;
-      unlockedAt: Date;
-    }>;
+    rank: PlayerRank;
+    unlockedRankRewards: RankRewardRecord[];
   },
   xpReward: number,
 ): void {
@@ -123,23 +109,21 @@ function applyXpAndLevelUps(
     user.xpToNextLevel = calculateXpToNextLevel(user.level);
 
     const newRank = rankForLevel(user.level);
+    if (newRank === user.rank) continue;
 
-    if (newRank !== user.rank) {
-      user.rank = newRank;
+    user.rank = newRank;
 
-      const reward = getRankReward(newRank);
-
-      if (
-        reward &&
-        !user.unlockedRankRewards.some(
-          (unlockedReward) => unlockedReward.rank === newRank,
-        )
-      ) {
-        user.unlockedRankRewards.push({
-          ...reward,
-          unlockedAt: new Date(),
-        });
-      }
+    const reward = getRankReward(newRank);
+    if (
+      reward &&
+      !user.unlockedRankRewards.some(
+        (unlockedReward) => unlockedReward.rank === newRank,
+      )
+    ) {
+      user.unlockedRankRewards.push({
+        ...reward,
+        unlockedAt: new Date(),
+      });
     }
   }
 }
@@ -152,21 +136,11 @@ export async function buyShopItem(itemId: string): Promise<void> {
   }
 
   const user = await UserModel.findOne().sort({ createdAt: 1 });
-
-  if (!user) {
-    throw new Error("Player not found.");
-  }
+  if (!user) throw new Error("Player not found.");
 
   const item = await ShopItemModel.findById(itemId);
-
-  if (!item) {
-    throw new Error("Shop item not found.");
-  }
-
-  if (user.gold < item.cost) {
-    throw new Error("Not enough gold.");
-  }
-
+  if (!item) throw new Error("Shop item not found.");
+  if (user.gold < item.cost) throw new Error("Not enough gold.");
   if (typeof item.stock === "number" && item.stock <= 0) {
     throw new Error("This item is out of stock.");
   }
@@ -179,7 +153,6 @@ export async function buyShopItem(itemId: string): Promise<void> {
   }
 
   await user.save();
-
   revalidatePath("/");
   revalidatePath("/admin");
 }
@@ -195,33 +168,21 @@ export async function completeQuest(
   }
 
   const user = await UserModel.findOne().sort({ createdAt: 1 });
-
-  if (!user) {
-    throw new Error("Player not found.");
-  }
+  if (!user) throw new Error("Player not found.");
 
   await processDailyQuestRollover(user._id);
 
   const currentUser = await UserModel.findById(user._id);
-
-  if (!currentUser) {
-    throw new Error("Player not found.");
-  }
+  if (!currentUser) throw new Error("Player not found.");
 
   const quest = await QuestModel.findById(questId);
-
-  if (!quest) {
-    throw new Error("Quest not found.");
-  }
+  if (!quest) throw new Error("Quest not found.");
 
   if (quest.isPermanentDaily && quest.type === "DAILY") {
     if (!quest.dailyQuestKey) {
       throw new Error("Permanent daily quest is missing dailyQuestKey.");
     }
 
-    const { getCurrentGameDateKey } = await import(
-      "@/lib/dailyQuestRollover"
-    );
     const dateKey = getCurrentGameDateKey(currentUser.timezone);
     const date = dateKeyToUtcDate(dateKey);
 
@@ -257,19 +218,14 @@ export async function completeQuest(
         ? selectableAttributes[0]
         : parseSelectedAttribute(formData, selectableAttributes);
 
-    const details = validateQuestDetails(formData);
-
     const updatedDailyRecord = await DailyQuestCompletionModel.findOneAndUpdate(
-      {
-        _id: dailyRecord._id,
-        status: "AVAILABLE",
-      },
+      { _id: dailyRecord._id, status: "AVAILABLE" },
       {
         $set: {
           status: "COMPLETED",
           completedAt: new Date(),
           allottedAttribute,
-          details,
+          details: validateQuestDetails(formData),
         },
       },
       { new: true },
@@ -286,7 +242,6 @@ export async function completeQuest(
     currentUser.gold += quest.goldReward;
     currentUser.markModified("attributes");
     currentUser.markModified("unlockedRankRewards");
-
     await currentUser.save();
 
     revalidatePath("/");
@@ -304,7 +259,6 @@ export async function completeQuest(
   );
 
   let allottedAttribute: PlayerAttribute | undefined;
-
   if (selectableAttributes.length === 1) {
     allottedAttribute = selectableAttributes[0];
   } else if (selectableAttributes.length > 1) {
@@ -322,7 +276,6 @@ export async function completeQuest(
   applyXpAndLevelUps(currentUser, quest.xpReward);
   currentUser.gold += quest.goldReward;
   currentUser.markModified("unlockedRankRewards");
-
   await currentUser.save();
 
   revalidatePath("/");
