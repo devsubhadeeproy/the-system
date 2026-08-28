@@ -11,6 +11,9 @@ import UserModel, {
 } from "@/models/User";
 import { DAILY_QUEST_DEFINITIONS } from "@/lib/dailyQuests";
 
+export const DAILY_CYCLE_RESET_HOUR = 2;
+export const DAILY_CYCLE_RESET_MINUTE = 30;
+
 const MISSED_QUEST_ATTRIBUTE_PENALTY = 1;
 
 type RolloverResult = {
@@ -20,16 +23,31 @@ type RolloverResult = {
   initializedToday: boolean;
 };
 
-function getDateKeyInTimezone(date: Date, timeZone: string): string {
+/**
+ * A System day starts at 02:30 in the player's local timezone.
+ *
+ * Shifting the instant backwards by 2h30m before formatting it
+ * as a calendar date makes 00:00-02:29 belong to the previous
+ * System day, while 02:30 starts the new one.
+ */
+export function getCurrentGameDateKey(
+  timezone: string,
+  now = new Date(),
+): string {
+  const shifted = new Date(
+    now.getTime() -
+      (DAILY_CYCLE_RESET_HOUR * 60 + DAILY_CYCLE_RESET_MINUTE) * 60_000,
+  );
+
   return new Intl.DateTimeFormat("en-CA", {
-    timeZone,
+    timeZone: timezone,
     year: "numeric",
     month: "2-digit",
     day: "2-digit",
-  }).format(date);
+  }).format(shifted);
 }
 
-function dateKeyToUtcDate(dateKey: string): Date {
+export function dateKeyToUtcDate(dateKey: string): Date {
   const [year, month, day] = dateKey.split("-").map(Number);
 
   if (
@@ -45,9 +63,7 @@ function dateKeyToUtcDate(dateKey: string): Date {
 
 function addDays(dateKey: string, amount: number): string {
   const date = dateKeyToUtcDate(dateKey);
-
   date.setUTCDate(date.getUTCDate() + amount);
-
   return date.toISOString().slice(0, 10);
 }
 
@@ -62,26 +78,13 @@ function selectPenaltyAttribute(
     (quest) => quest.key === questKey,
   );
 
-  if (!definition) {
-    return undefined;
-  }
-
-  return definition.targetAttributes.find((attribute) =>
+  return definition?.targetAttributes.find((attribute) =>
     PLAYER_ATTRIBUTES.includes(attribute),
   );
 }
 
-/**
- * Ensure that a daily completion record exists for
- * a particular quest/day.
- *
- * DailyQuestCompletion is intentionally not tied to userId
- * because the current application has a single player.
- *
- * The unique dailyQuestKey + date index guarantees that
- * repeated calls remain idempotent.
- */
 async function ensureDailyRecord(
+  userId: Types.ObjectId,
   questKey: string,
   dateKey: string,
 ): Promise<void> {
@@ -89,20 +92,20 @@ async function ensureDailyRecord(
 
   await DailyQuestCompletionModel.updateOne(
     {
+      userId,
       dailyQuestKey: questKey,
       date,
     },
     {
       $setOnInsert: {
+        userId,
         dailyQuestKey: questKey,
         date,
         status: "AVAILABLE",
         penaltyApplied: false,
       },
     },
-    {
-      upsert: true,
-    },
+    { upsert: true },
   );
 }
 
@@ -117,14 +120,6 @@ async function applyMissedQuestPenalty(
     return false;
   }
 
-  /**
-   * Penalty creation is protected by the unique index
-   * on the Penalty model.
-   *
-   * If rollover runs twice, the second execution receives
-   * a duplicate-key error and does not subtract the
-   * attribute again.
-   */
   try {
     await PenaltyModel.create({
       userId: user._id,
@@ -152,38 +147,21 @@ async function applyMissedQuestPenalty(
     0,
     user.attributes[attribute] - MISSED_QUEST_ATTRIBUTE_PENALTY,
   );
-
   user.markModified("attributes");
-
   await user.save();
 
   await PenaltyModel.updateOne(
-    {
-      userId: user._id,
-      questKey,
-      dateKey,
-      applied: false,
-    },
-    {
-      $set: {
-        applied: true,
-        appliedAt: new Date(),
-      },
-    },
+    { userId: user._id, questKey, dateKey, applied: false },
+    { $set: { applied: true, appliedAt: new Date() } },
   );
 
   return true;
 }
 
 /**
- * Processes daily quest rollover for the player.
+ * Processes the player's System-day rollover.
  *
- * Properties:
- * - Safe to call repeatedly.
- * - Does not punish the player twice.
- * - Handles multiple missed calendar days.
- * - Uses the player's timezone.
- * - Creates today's daily quest records.
+ * The cycle boundary is 02:30 local time, not midnight.
  */
 export async function processDailyQuestRollover(
   userId: Types.ObjectId,
@@ -196,40 +174,26 @@ export async function processDailyQuestRollover(
     throw new Error("Player not found.");
   }
 
-  const currentDateKey = getDateKeyInTimezone(
-    new Date(),
-    user.timezone,
-  );
+  const currentDateKey = getCurrentGameDateKey(user.timezone);
 
   const dailyQuests = await QuestModel.find({
     isPermanentDaily: true,
     type: "DAILY",
-    dailyQuestKey: {
-      $exists: true,
-      $ne: null,
-    },
+    dailyQuestKey: { $exists: true, $ne: null },
   }).lean();
 
-  /**
-   * First-time initialization.
-   *
-   * We create today's records but do not punish the player
-   * for any dates before daily tracking started.
-   */
   if (!user.lastDailyQuestProcessedDate) {
     for (const quest of dailyQuests) {
-      if (!quest.dailyQuestKey) {
-        continue;
+      if (quest.dailyQuestKey) {
+        await ensureDailyRecord(
+          user._id,
+          quest.dailyQuestKey,
+          currentDateKey,
+        );
       }
-
-      await ensureDailyRecord(
-        quest.dailyQuestKey,
-        currentDateKey,
-      );
     }
 
     user.lastDailyQuestProcessedDate = currentDateKey;
-
     await user.save();
 
     return {
@@ -240,20 +204,11 @@ export async function processDailyQuestRollover(
     };
   }
 
-  let dateToProcess = addDays(
-    user.lastDailyQuestProcessedDate,
-    1,
-  );
-
+  let dateToProcess = addDays(user.lastDailyQuestProcessedDate, 1);
   const yesterday = getYesterday(currentDateKey);
-
   let missedQuestCount = 0;
   let penaltiesApplied = 0;
 
-  /**
-   * Process every completed calendar day between the
-   * last processed date and yesterday.
-   */
   while (dateToProcess <= yesterday) {
     for (const quest of dailyQuests) {
       const questKey = quest.dailyQuestKey;
@@ -262,12 +217,10 @@ export async function processDailyQuestRollover(
         continue;
       }
 
-      await ensureDailyRecord(
-        questKey,
-        dateToProcess,
-      );
+      await ensureDailyRecord(user._id, questKey, dateToProcess);
 
       const dailyRecord = await DailyQuestCompletionModel.findOne({
+        userId: user._id,
         dailyQuestKey: questKey,
         date: dateKeyToUtcDate(dateToProcess),
       });
@@ -276,66 +229,36 @@ export async function processDailyQuestRollover(
         continue;
       }
 
-      /**
-       * Already completed — nothing to do.
-       */
-      if (dailyRecord.status === "COMPLETED") {
-        continue;
-      }
-
-      /**
-       * A previous rollover may already have marked it
-       * missed. Never punish it again.
-       */
-      if (dailyRecord.status === "MISSED") {
-        continue;
-      }
-
-      /**
-       * Both AVAILABLE and PENDING represent an unfinished
-       * daily quest whose calendar day has ended.
-       */
       if (
-        dailyRecord.status === "AVAILABLE" ||
-        dailyRecord.status === "PENDING"
+        dailyRecord.status === "COMPLETED" ||
+        dailyRecord.status === "MISSED"
       ) {
-        dailyRecord.status = "MISSED";
+        continue;
+      }
 
-        await dailyRecord.save();
+      dailyRecord.status = "MISSED";
+      await dailyRecord.save();
+      missedQuestCount += 1;
 
-        missedQuestCount += 1;
-
-        const penaltyApplied = await applyMissedQuestPenalty(
-          user,
-          questKey,
-          dateToProcess,
-        );
-
-        if (penaltyApplied) {
-          penaltiesApplied += 1;
-        }
+      if (await applyMissedQuestPenalty(user, questKey, dateToProcess)) {
+        penaltiesApplied += 1;
       }
     }
 
     dateToProcess = addDays(dateToProcess, 1);
   }
 
-  /**
-   * Today's records must always exist.
-   */
   for (const quest of dailyQuests) {
-    if (!quest.dailyQuestKey) {
-      continue;
+    if (quest.dailyQuestKey) {
+      await ensureDailyRecord(
+        user._id,
+        quest.dailyQuestKey,
+        currentDateKey,
+      );
     }
-
-    await ensureDailyRecord(
-      quest.dailyQuestKey,
-      currentDateKey,
-    );
   }
 
   user.lastDailyQuestProcessedDate = currentDateKey;
-
   await user.save();
 
   return {
