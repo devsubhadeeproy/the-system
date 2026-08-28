@@ -6,7 +6,16 @@ import {
   type Model,
 } from "mongoose";
 
-export const PLAYER_RANKS = ["E", "D", "C", "B", "A", "S"] as const;
+export const PLAYER_RANKS = [
+  "E",
+  "D",
+  "C",
+  "B",
+  "A",
+  "S",
+  "NATIONAL",
+  "MONARCH",
+] as const;
 
 export const PLAYER_ATTRIBUTES = [
   "STR",
@@ -23,6 +32,15 @@ export type PlayerAttribute = (typeof PLAYER_ATTRIBUTES)[number];
 
 export type UserAttributes = Record<PlayerAttribute, number>;
 
+export type UnlockedRankReward = {
+  rank: Exclude<PlayerRank, "E">;
+  title: string;
+  description: string;
+  triggerObject: string;
+  alterEgoName: string;
+  unlockedAt: Date;
+};
+
 export interface User {
   name: string;
 
@@ -34,23 +52,18 @@ export interface User {
 
   attributes: UserAttributes;
 
+  /** Psychological rewards unlocked as rank milestones are reached. */
+  unlockedRankRewards: UnlockedRankReward[];
+
   /**
    * IANA timezone used when determining when a new
    * "game day" begins.
-   *
-   * Example:
-   * Asia/Kolkata
-   * America/New_York
-   * Europe/London
    */
   timezone: string;
 
   /**
-   * Last calendar date for which daily quest rollover
-   * has been processed.
-   *
-   * Stored as YYYY-MM-DD rather than Date so that
-   * rollover is timezone-safe and idempotent.
+   * Last game-day date for which daily quest rollover
+   * has been processed. A game day starts at 02:30 local time.
    */
   lastDailyQuestProcessedDate?: string;
 }
@@ -66,6 +79,22 @@ const attributesSchema = new Schema<UserAttributes>(
     MANA: { type: Number, required: true, default: 10, min: 0 },
     LIF: { type: Number, required: true, default: 10, min: 0 },
     REC: { type: Number, required: true, default: 10, min: 0 },
+  },
+  { _id: false },
+);
+
+const unlockedRankRewardSchema = new Schema<UnlockedRankReward>(
+  {
+    rank: {
+      type: String,
+      required: true,
+      enum: PLAYER_RANKS.filter((rank) => rank !== "E"),
+    },
+    title: { type: String, required: true },
+    description: { type: String, required: true },
+    triggerObject: { type: String, required: true },
+    alterEgoName: { type: String, required: true },
+    unlockedAt: { type: Date, required: true, default: Date.now },
   },
   { _id: false },
 );
@@ -119,6 +148,12 @@ const userSchema = new Schema<User>(
       type: attributesSchema,
       required: true,
       default: () => ({}),
+    },
+
+    unlockedRankRewards: {
+      type: [unlockedRankRewardSchema],
+      required: true,
+      default: [],
     },
 
     timezone: {
