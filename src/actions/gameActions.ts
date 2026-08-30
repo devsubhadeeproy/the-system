@@ -17,13 +17,18 @@ import UserModel, {
   PLAYER_ATTRIBUTES,
   type PlayerAttribute,
   type PlayerRank,
+  type UnlockedRankReward,
 } from "@/models/User";
 import {
   dateKeyToUtcDate,
   getCurrentGameDateKey,
   processDailyQuestRollover,
 } from "@/lib/dailyQuestRollover";
-import { getRankReward, rankForLevel } from "@/lib/rankProgression";
+import {
+  getRankReward,
+  rankForLevel,
+  rankStartLevel,
+} from "@/lib/rankProgression";
 
 function formString(formData: FormData, name: string): string {
   const value = formData.get(name);
@@ -96,14 +101,7 @@ function calculateXpToNextLevel(level: number): number {
   return 100 + (level - 1) * 25;
 }
 
-type RankRewardRecord = {
-  rank: PlayerRank;
-  title: string;
-  description: string;
-  triggerObject: string;
-  alterEgoName: string;
-  unlockedAt: Date;
-};
+type RankRewardRecord = UnlockedRankReward;
 
 function applyXpAndLevelUps(
   user: {
@@ -203,17 +201,6 @@ export async function createShopItem(formData: FormData): Promise<void> {
   revalidatePath("/admin");
 }
 
-/**
- * Development-only test control.
- *
- * The real rollover remains driven by the normal 02:30 game-day calculation.
- * This action only moves the player's checkpoint backwards by two System days
- * immediately before invoking that same rollover function. That makes the
- * real rollover process the test subject instead of duplicating its logic.
- *
- * The action is unavailable in production so an unprotected admin page cannot
- * be used to manufacture missed-task penalties in a live environment.
- */
 export async function simulateDailyQuestRollover(): Promise<void> {
   if (process.env.NODE_ENV === "production") {
     throw new Error("The daily rollover simulator is disabled in production.");
@@ -222,14 +209,10 @@ export async function simulateDailyQuestRollover(): Promise<void> {
   await connectMongoDB();
 
   const user = await UserModel.findOne().sort({ createdAt: 1 });
-  if (!user) {
-    throw new Error("Player not found.");
-  }
+  if (!user) throw new Error("Player not found.");
 
   const currentGameDateKey = getCurrentGameDateKey(user.timezone);
-  const simulatedLastProcessedDate = addDateKey(currentGameDateKey, -2);
-
-  user.lastDailyQuestProcessedDate = simulatedLastProcessedDate;
+  user.lastDailyQuestProcessedDate = addDateKey(currentGameDateKey, -2);
   await user.save();
 
   await processDailyQuestRollover(user._id);
@@ -238,12 +221,98 @@ export async function simulateDailyQuestRollover(): Promise<void> {
   revalidatePath("/admin");
 }
 
+/**
+ * Development-only, non-destructive rank reward simulator.
+ *
+ * It clones the player's progression state in memory and uses the same
+ * rank/reward calculation path as real quest XP. Nothing is written to User.
+ */
+export async function simulateRankReward(formData: FormData): Promise<{
+  ok: boolean;
+  message: string;
+  currentLevel: number;
+  currentRank: PlayerRank;
+  targetRank: Exclude<PlayerRank, "E">;
+  targetLevel: number | null;
+  rewards: UnlockedRankReward[];
+}> {
+  if (process.env.NODE_ENV === "production") {
+    throw new Error("The rank reward simulator is disabled in production.");
+  }
+
+  const targetRank = formString(formData, "targetRank") as Exclude<PlayerRank, "E">;
+  const validRanks: Array<Exclude<PlayerRank, "E">> = [
+    "D",
+    "C",
+    "B",
+    "A",
+    "S",
+    "NATIONAL",
+    "MONARCH",
+  ];
+
+  if (!validRanks.includes(targetRank)) {
+    throw new Error("Invalid target rank.");
+  }
+
+  await connectMongoDB();
+
+  const user = await UserModel.findOne().sort({ createdAt: 1 });
+  if (!user) throw new Error("Player not found.");
+
+  const targetLevel = rankStartLevel(targetRank);
+
+  if (targetLevel <= user.level) {
+    const existingReward = user.unlockedRankRewards.find(
+      (reward) => reward.rank === targetRank,
+    );
+
+    return {
+      ok: true,
+      message: `${targetRank === "NATIONAL" ? "National Level" : targetRank}-Rank is already at or below the player's current level (${user.level}). No data was changed.${existingReward ? " The reward is already unlocked." : " The rank reward has not been recorded for this player."}`,
+      currentLevel: user.level,
+      currentRank: user.rank,
+      targetRank,
+      targetLevel,
+      rewards: existingReward ? [existingReward] : [],
+    };
+  }
+
+  const simulatedUser = {
+    currentXp: 0,
+    xpToNextLevel: user.xpToNextLevel,
+    level: user.level,
+    rank: user.rank,
+    unlockedRankRewards: user.unlockedRankRewards.map((reward) => ({
+      ...reward,
+      unlockedAt: new Date(reward.unlockedAt),
+    })),
+  };
+
+  const rewardsBefore = simulatedUser.unlockedRankRewards.length;
+
+  while (simulatedUser.level < targetLevel) {
+    simulatedUser.currentXp = simulatedUser.xpToNextLevel;
+    applyXpAndLevelUps(simulatedUser, 0);
+  }
+
+  const newRewards = simulatedUser.unlockedRankRewards.slice(rewardsBefore);
+
+  return {
+    ok: true,
+    message: `Simulation reached ${targetRank === "NATIONAL" ? "National Level" : targetRank}-Rank at level ${targetLevel}. No player data was changed.`,
+    currentLevel: user.level,
+    currentRank: user.rank,
+    targetRank,
+    targetLevel,
+    rewards: newRewards,
+  };
+}
+
 export async function buyShopItem(itemId: string): Promise<void> {
   await connectMongoDB();
 
-  if (!Types.ObjectId.isValid(itemId)) {
-    throw new Error("Invalid shop item ID.");
-  }
+  if (!Types.ObjectId.isValid(itemId)) throw new Error("Invalid shop item ID.");
 
   const user = await UserModel.findOne().sort({ createdAt: 1 });
   if (!user) throw new Error("Player not found.");
@@ -251,12 +320,9 @@ export async function buyShopItem(itemId: string): Promise<void> {
   const item = await ShopItemModel.findById(itemId);
   if (!item) throw new Error("Shop item not found.");
   if (user.gold < item.cost) throw new Error("Not enough gold.");
-  if (typeof item.stock === "number" && item.stock <= 0) {
-    throw new Error("This item is out of stock.");
-  }
+  if (typeof item.stock === "number" && item.stock <= 0) throw new Error("This item is out of stock.");
 
   user.gold -= item.cost;
-
   if (typeof item.stock === "number") {
     item.stock -= 1;
     await item.save();
@@ -267,15 +333,10 @@ export async function buyShopItem(itemId: string): Promise<void> {
   revalidatePath("/admin");
 }
 
-export async function completeQuest(
-  questId: string,
-  formData: FormData,
-): Promise<void> {
+export async function completeQuest(questId: string, formData: FormData): Promise<void> {
   await connectMongoDB();
 
-  if (!Types.ObjectId.isValid(questId)) {
-    throw new Error("Invalid quest ID.");
-  }
+  if (!Types.ObjectId.isValid(questId)) throw new Error("Invalid quest ID.");
 
   const user = await UserModel.findOne().sort({ createdAt: 1 });
   if (!user) throw new Error("Player not found.");
@@ -289,63 +350,36 @@ export async function completeQuest(
   if (!quest) throw new Error("Quest not found.");
 
   if (quest.isPermanentDaily && quest.type === "DAILY") {
-    if (!quest.dailyQuestKey) {
-      throw new Error("Permanent daily quest is missing dailyQuestKey.");
-    }
+    if (!quest.dailyQuestKey) throw new Error("Permanent daily quest is missing dailyQuestKey.");
 
     const dateKey = getCurrentGameDateKey(currentUser.timezone);
     const date = dateKeyToUtcDate(dateKey);
-
     const dailyRecord = await DailyQuestCompletionModel.findOne({
       userId: currentUser._id,
       dailyQuestKey: quest.dailyQuestKey,
       date,
     });
 
-    if (!dailyRecord) {
-      throw new Error("Today's daily quest record does not exist.");
-    }
-
-    if (dailyRecord.status === "COMPLETED") {
-      throw new Error("This daily quest has already been completed today.");
-    }
-
-    if (dailyRecord.status === "MISSED") {
-      throw new Error("This daily quest has already been missed.");
-    }
+    if (!dailyRecord) throw new Error("Today's daily quest record does not exist.");
+    if (dailyRecord.status === "COMPLETED") throw new Error("This daily quest has already been completed today.");
+    if (dailyRecord.status === "MISSED") throw new Error("This daily quest has already been missed.");
 
     const selectableAttributes = quest.targetAttributes.filter(
-      (attribute): attribute is PlayerAttribute =>
-        attribute !== "NONE" && PLAYER_ATTRIBUTES.includes(attribute),
+      (attribute): attribute is PlayerAttribute => attribute !== "NONE" && PLAYER_ATTRIBUTES.includes(attribute),
     );
+    if (selectableAttributes.length === 0) throw new Error("This quest does not have a valid reward attribute.");
 
-    if (selectableAttributes.length === 0) {
-      throw new Error("This quest does not have a valid reward attribute.");
-    }
-
-    const allottedAttribute =
-      selectableAttributes.length === 1
-        ? selectableAttributes[0]
-        : parseSelectedAttribute(formData, selectableAttributes);
+    const allottedAttribute = selectableAttributes.length === 1
+      ? selectableAttributes[0]
+      : parseSelectedAttribute(formData, selectableAttributes);
 
     const updatedDailyRecord = await DailyQuestCompletionModel.findOneAndUpdate(
       { _id: dailyRecord._id, status: "AVAILABLE" },
-      {
-        $set: {
-          status: "COMPLETED",
-          completedAt: new Date(),
-          allottedAttribute,
-          details: validateQuestDetails(formData),
-        },
-      },
+      { $set: { status: "COMPLETED", completedAt: new Date(), allottedAttribute, details: validateQuestDetails(formData) } },
       { new: true },
     );
 
-    if (!updatedDailyRecord) {
-      throw new Error(
-        "Quest completion could not be finalized. It may have already been completed.",
-      );
-    }
+    if (!updatedDailyRecord) throw new Error("Quest completion could not be finalized. It may have already been completed.");
 
     currentUser.attributes[allottedAttribute] += 1;
     applyXpAndLevelUps(currentUser, quest.xpReward);
@@ -359,21 +393,15 @@ export async function completeQuest(
     return;
   }
 
-  if (quest.completed) {
-    throw new Error("This quest has already been completed.");
-  }
+  if (quest.completed) throw new Error("This quest has already been completed.");
 
   const selectableAttributes = quest.targetAttributes.filter(
-    (attribute): attribute is PlayerAttribute =>
-      attribute !== "NONE" && PLAYER_ATTRIBUTES.includes(attribute),
+    (attribute): attribute is PlayerAttribute => attribute !== "NONE" && PLAYER_ATTRIBUTES.includes(attribute),
   );
 
   let allottedAttribute: PlayerAttribute | undefined;
-  if (selectableAttributes.length === 1) {
-    allottedAttribute = selectableAttributes[0];
-  } else if (selectableAttributes.length > 1) {
-    allottedAttribute = parseSelectedAttribute(formData, selectableAttributes);
-  }
+  if (selectableAttributes.length === 1) allottedAttribute = selectableAttributes[0];
+  else if (selectableAttributes.length > 1) allottedAttribute = parseSelectedAttribute(formData, selectableAttributes);
 
   quest.completed = true;
   await quest.save();
