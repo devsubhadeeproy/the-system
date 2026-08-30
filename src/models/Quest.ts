@@ -8,7 +8,7 @@ import {
 
 import { PLAYER_ATTRIBUTES, type PlayerAttribute } from "@/models/User";
 
-export const QUEST_TYPES = ["DAILY", "MAIN", "SIDE", "URGENT"] as const;
+export const QUEST_TYPES = ["DAILY", "URGENT"] as const;
 
 export const QUEST_TARGET_ATTRIBUTES = [...PLAYER_ATTRIBUTES, "NONE"] as const;
 
