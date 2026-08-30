@@ -4,7 +4,13 @@ import { Types } from "mongoose";
 import { revalidatePath } from "next/cache";
 
 import connectMongoDB from "@/lib/mongodb";
-import QuestModel from "@/models/Quest";
+import QuestModel, {
+  QUEST_TARGET_ATTRIBUTES,
+  QUEST_TYPES,
+  type QuestScalingDirection,
+  type QuestTargetAttribute,
+  type QuestType,
+} from "@/models/Quest";
 import DailyQuestCompletionModel from "@/models/DailyQuestCompletion";
 import ShopItemModel from "@/models/ShopItem";
 import UserModel, {
@@ -26,6 +32,17 @@ function formString(formData: FormData, name: string): string {
 function formOptionalString(formData: FormData, name: string): string | undefined {
   const value = formString(formData, name);
   return value.length > 0 ? value : undefined;
+}
+
+function formNumber(formData: FormData, name: string): number {
+  const value = formString(formData, name);
+  const parsed = Number(value);
+
+  if (!value || !Number.isFinite(parsed) || parsed < 0) {
+    throw new Error(`Invalid ${name}.`);
+  }
+
+  return parsed;
 }
 
 function formOptionalNumber(formData: FormData, name: string): number | undefined {
@@ -126,6 +143,67 @@ function applyXpAndLevelUps(
       });
     }
   }
+}
+
+export async function createQuest(formData: FormData): Promise<void> {
+  await connectMongoDB();
+
+  const title = formString(formData, "title");
+  const description = formString(formData, "description");
+  const type = formString(formData, "type") as QuestType;
+  const targetAttribute = formString(formData, "targetAttribute") as QuestTargetAttribute;
+  const xpReward = formNumber(formData, "xpReward");
+  const goldReward = formNumber(formData, "goldReward");
+
+  if (!title || !description) {
+    throw new Error("Quest title and description are required.");
+  }
+
+  if (!QUEST_TYPES.includes(type)) {
+    throw new Error("Invalid quest type.");
+  }
+
+  if (!QUEST_TARGET_ATTRIBUTES.includes(targetAttribute)) {
+    throw new Error("Invalid quest target attribute.");
+  }
+
+  await QuestModel.create({
+    title,
+    description,
+    type,
+    targetAttributes: [targetAttribute],
+    xpReward,
+    goldReward,
+    completed: false,
+    isPermanentDaily: false,
+    scalingDirection: "CONSTANT" satisfies QuestScalingDirection,
+  });
+
+  revalidatePath("/");
+  revalidatePath("/admin");
+}
+
+export async function createShopItem(formData: FormData): Promise<void> {
+  await connectMongoDB();
+
+  const title = formString(formData, "title");
+  const description = formString(formData, "description");
+  const cost = formNumber(formData, "cost");
+  const stock = formOptionalNumber(formData, "stock");
+
+  if (!title || !description) {
+    throw new Error("Shop item title and description are required.");
+  }
+
+  await ShopItemModel.create({
+    title,
+    description,
+    cost,
+    ...(stock === undefined ? {} : { stock }),
+  });
+
+  revalidatePath("/");
+  revalidatePath("/admin");
 }
 
 export async function buyShopItem(itemId: string): Promise<void> {
