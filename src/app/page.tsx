@@ -32,7 +32,7 @@ type PlayerViewModel = {
     description: string;
     triggerObject: string;
     alterEgoName: string;
-    unlockedAt: Date;
+    unlockedAt: string;
   }>;
 };
 
@@ -69,7 +69,7 @@ function targetAttributesForQuest(targetAttributes: QuestTargetAttribute[] | und
 
 async function getDashboardData(): Promise<DashboardData> {
   await connectMongoDB();
-  const player = (await UserModel.findOne().sort({ createdAt: 1 })) ?? (await UserModel.create({ name: "Sung Jin-Woo" }));
+  const player = (await UserModel.findOne().sort({ createdAt: 1 })) ?? (await UserModel.create({ name: "Subhadeep Roy" }));
   await processDailyQuestRollover(player._id);
   const currentPlayer = await UserModel.findById(player._id);
   if (!currentPlayer) throw new Error("Player not found.");
@@ -100,7 +100,14 @@ async function getDashboardData(): Promise<DashboardData> {
       rank: currentPlayer.rank,
       gold: currentPlayer.gold,
       attributes: normalizedAttributes,
-      unlockedRankRewards: currentPlayer.unlockedRankRewards.map((reward) => ({ ...reward.toObject?.() ?? reward, unlockedAt: new Date(reward.unlockedAt) })),
+      unlockedRankRewards: currentPlayer.unlockedRankRewards.map((reward) => ({
+        rank: reward.rank,
+        title: reward.title,
+        description: reward.description,
+        triggerObject: reward.triggerObject,
+        alterEgoName: reward.alterEgoName,
+        unlockedAt: new Date(reward.unlockedAt).toISOString(),
+      })),
     },
     quests: quests.map((quest) => {
       const dailyCompletion = quest.dailyQuestKey ? dailyCompletionByKey.get(quest.dailyQuestKey) : undefined;
