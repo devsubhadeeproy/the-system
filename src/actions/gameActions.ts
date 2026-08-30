@@ -22,7 +22,6 @@ import {
   dateKeyToUtcDate,
   getCurrentGameDateKey,
   processDailyQuestRollover,
-  processDailyQuestRolloverForDate,
 } from "@/lib/dailyQuestRollover";
 import { getRankReward, rankForLevel } from "@/lib/rankProgression";
 
@@ -207,14 +206,13 @@ export async function createShopItem(formData: FormData): Promise<void> {
 /**
  * Development-only test control.
  *
- * It advances the player's System day by exactly one cycle without waiting
- * for the real 02:30 boundary. The current cycle becomes the simulated
- * previous day, so unfinished daily quests are processed exactly as they
- * would be by the real rollover, including penalties. A fresh cycle is then
- * initialized.
+ * The real rollover remains driven by the normal 02:30 game-day calculation.
+ * This action only moves the player's checkpoint backwards by two System days
+ * immediately before invoking that same rollover function. That makes the
+ * real rollover process the test subject instead of duplicating its logic.
  *
- * This action is deliberately unavailable in production so an unprotected
- * admin page cannot be used to manufacture missed-task penalties.
+ * The action is unavailable in production so an unprotected admin page cannot
+ * be used to manufacture missed-task penalties in a live environment.
  */
 export async function simulateDailyQuestRollover(): Promise<void> {
   if (process.env.NODE_ENV === "production") {
@@ -229,12 +227,12 @@ export async function simulateDailyQuestRollover(): Promise<void> {
   }
 
   const currentGameDateKey = getCurrentGameDateKey(user.timezone);
-  const simulatedNextDateKey = addDateKey(currentGameDateKey, 1);
+  const simulatedLastProcessedDate = addDateKey(currentGameDateKey, -2);
 
-  await processDailyQuestRolloverForDate(
-    user._id,
-    simulatedNextDateKey,
-  );
+  user.lastDailyQuestProcessedDate = simulatedLastProcessedDate;
+  await user.save();
+
+  await processDailyQuestRollover(user._id);
 
   revalidatePath("/");
   revalidatePath("/admin");
