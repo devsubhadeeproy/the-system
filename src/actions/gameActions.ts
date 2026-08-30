@@ -19,6 +19,7 @@ import UserModel, {
   type PlayerRank,
 } from "@/models/User";
 import {
+  dateKeyToUtcDate,
   getCurrentGameDateKey,
   processDailyQuestRollover,
 } from "@/lib/dailyQuestRollover";
@@ -57,14 +58,10 @@ function formOptionalNumber(formData: FormData, name: string): number | undefine
   return parsed;
 }
 
-function dateKeyToUtcDate(dateKey: string): Date {
-  const [year, month, day] = dateKey.split("-").map(Number);
-
-  if (!Number.isInteger(year) || !Number.isInteger(month) || !Number.isInteger(day)) {
-    throw new Error(`Invalid date key: ${dateKey}`);
-  }
-
-  return new Date(Date.UTC(year, month - 1, day));
+function addDateKey(dateKey: string, amount: number): string {
+  const date = dateKeyToUtcDate(dateKey);
+  date.setUTCDate(date.getUTCDate() + amount);
+  return date.toISOString().slice(0, 10);
 }
 
 function parseSelectedAttribute(
@@ -201,6 +198,41 @@ export async function createShopItem(formData: FormData): Promise<void> {
     cost,
     ...(stock === undefined ? {} : { stock }),
   });
+
+  revalidatePath("/");
+  revalidatePath("/admin");
+}
+
+/**
+ * Development-only test control.
+ *
+ * The real rollover remains driven by the normal 02:30 game-day calculation.
+ * This action only moves the player's checkpoint backwards by two System days
+ * immediately before invoking that same rollover function. That makes the
+ * real rollover process the test subject instead of duplicating its logic.
+ *
+ * The action is unavailable in production so an unprotected admin page cannot
+ * be used to manufacture missed-task penalties in a live environment.
+ */
+export async function simulateDailyQuestRollover(): Promise<void> {
+  if (process.env.NODE_ENV === "production") {
+    throw new Error("The daily rollover simulator is disabled in production.");
+  }
+
+  await connectMongoDB();
+
+  const user = await UserModel.findOne().sort({ createdAt: 1 });
+  if (!user) {
+    throw new Error("Player not found.");
+  }
+
+  const currentGameDateKey = getCurrentGameDateKey(user.timezone);
+  const simulatedLastProcessedDate = addDateKey(currentGameDateKey, -2);
+
+  user.lastDailyQuestProcessedDate = simulatedLastProcessedDate;
+  await user.save();
+
+  await processDailyQuestRollover(user._id);
 
   revalidatePath("/");
   revalidatePath("/admin");
