@@ -37,7 +37,7 @@ export const DAILY_QUEST_DEFINITIONS: DailyQuestDefinition[] = [
     targetAttributes: ["LIF"],
     targetLabel: "5:00 AM",
     scalingDirection: "CONSTANT",
-    xpReward: 35,
+    xpReward: 30,
     goldReward: 15,
   },
   {
@@ -48,7 +48,7 @@ export const DAILY_QUEST_DEFINITIONS: DailyQuestDefinition[] = [
     baseTargetMinutes: 30,
     targetLabel: "30 minutes++",
     scalingDirection: "UP",
-    xpReward: 55,
+    xpReward: 20,
     goldReward: 20,
   },
   {
@@ -59,7 +59,7 @@ export const DAILY_QUEST_DEFINITIONS: DailyQuestDefinition[] = [
     baseTargetMinutes: 120,
     targetLabel: "2 hours",
     scalingDirection: "CONSTANT",
-    xpReward: 85,
+    xpReward: 40,
     goldReward: 35,
   },
   {
@@ -69,7 +69,7 @@ export const DAILY_QUEST_DEFINITIONS: DailyQuestDefinition[] = [
     targetAttributes: ["INT"],
     targetLabel: "Standard",
     scalingDirection: "CONSTANT",
-    xpReward: 65,
+    xpReward: 30,
     goldReward: 25,
   },
   {
@@ -79,7 +79,7 @@ export const DAILY_QUEST_DEFINITIONS: DailyQuestDefinition[] = [
     targetAttributes: ["REC"],
     targetLabel: "Standard",
     scalingDirection: "CONSTANT",
-    xpReward: 30,
+    xpReward: 15,
     goldReward: 10,
   },
   {
@@ -90,7 +90,7 @@ export const DAILY_QUEST_DEFINITIONS: DailyQuestDefinition[] = [
     baseTargetMinutes: 180,
     targetLabel: "3 hours++",
     scalingDirection: "UP",
-    xpReward: 110,
+    xpReward: 50,
     goldReward: 45,
   },
   {
@@ -101,7 +101,7 @@ export const DAILY_QUEST_DEFINITIONS: DailyQuestDefinition[] = [
     baseTargetMinutes: 25,
     targetLabel: "25 minutes--",
     scalingDirection: "DOWN",
-    xpReward: 25,
+    xpReward: 20,
     goldReward: 10,
   },
   {
@@ -112,7 +112,7 @@ export const DAILY_QUEST_DEFINITIONS: DailyQuestDefinition[] = [
     baseTargetMinutes: 60,
     targetLabel: "1 hour",
     scalingDirection: "CONSTANT",
-    xpReward: 45,
+    xpReward: 20,
     goldReward: 15,
   },
   {
@@ -123,7 +123,7 @@ export const DAILY_QUEST_DEFINITIONS: DailyQuestDefinition[] = [
     baseTargetMinutes: 60,
     targetLabel: "1 hour",
     scalingDirection: "CONSTANT",
-    xpReward: 40,
+    xpReward: 30,
     goldReward: 15,
   },
   {
@@ -134,7 +134,7 @@ export const DAILY_QUEST_DEFINITIONS: DailyQuestDefinition[] = [
     baseTargetMinutes: 30,
     targetLabel: "30 minutes++",
     scalingDirection: "UP",
-    xpReward: 60,
+    xpReward: 40,
     goldReward: 20,
   },
 ];
