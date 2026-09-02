@@ -282,13 +282,19 @@ export async function processDailyQuestRollover(
 
 export async function processAllUsersDailyQuestRollover(
   now: Date = new Date(),
-): Promise<void> {
+): Promise<{
+  processedUsers: number;
+  dailyQuests: number;
+}> {
   await connectMongoDB();
 
-  /*
-   * Seed definitions even if there are currently no users.
-   */
   await ensurePermanentDailyQuestDefinitions();
+
+  const dailyQuests = await QuestModel.countDocuments({
+    isPermanentDaily: true,
+    type: "DAILY",
+    dailyQuestKey: { $exists: true, $ne: null },
+  });
 
   const users = await UserModel.find({}).lean();
 
@@ -302,4 +308,9 @@ export async function processAllUsersDailyQuestRollover(
       now,
     );
   }
+
+  return {
+    processedUsers: users.length,
+    dailyQuests,
+  };
 }
