@@ -132,7 +132,7 @@ export async function completeQuest(questId: string, formData: FormData): Promis
   const user = await UserModel.findOne().sort({ createdAt: 1 });
   if (!user) throw new Error("Player not found.");
 
-  await processDailyQuestRollover(user._id);
+  await processDailyQuestRollover(user._id.toString());
   const currentUser = await UserModel.findById(user._id);
   if (!currentUser) throw new Error("Player not found.");
   const quest = await QuestModel.findById(questId);
