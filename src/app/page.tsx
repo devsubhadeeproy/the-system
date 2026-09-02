@@ -70,7 +70,7 @@ function targetAttributesForQuest(targetAttributes: QuestTargetAttribute[] | und
 async function getDashboardData(): Promise<DashboardData> {
   await connectMongoDB();
   const player = (await UserModel.findOne().sort({ createdAt: 1 })) ?? (await UserModel.create({ name: "Subhadeep Roy" }));
-  await processDailyQuestRollover(player._id);
+  await processDailyQuestRollover(player._id.toString());
   const currentPlayer = await UserModel.findById(player._id);
   if (!currentPlayer) throw new Error("Player not found.");
 
